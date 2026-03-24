@@ -1,258 +1,328 @@
-# hardware/ft_sensor_client.py
 """
-DG-5F-M 개발자 모드용 핑거팁 F/T 센서 리더
-
-- 통신 방식: TCP/IP
-- 명령어: Get Data(0x01)
-- 데이터 종류: F/T Sensor(0x05)
-- 반환 순서(센서당): Fx, Fy, Fz, Tx, Ty, Tz
-- 데이터 타입: signed int16, big-endian
-- 단위:
-    Force  = 0.1 N
-    Torque = 0.1 Nm
+Force/Torque Sensor Client for Tesollo Hand Teleoperation
+Real-time 6-axis force/torque data acquisition with safety monitoring
 """
-
-from __future__ import annotations
 
 import socket
 import struct
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional
+import threading
+import time
+import numpy as np
+from typing import Optional, Tuple, Dict
+import logging
+
+from config.constants import (
+    FT_SENSOR_IP, FT_SENSOR_PORT, FT_TIMEOUT,
+    FT_SAMPLE_RATE, MAX_FORCE_LIMIT, MAX_TORQUE_LIMIT,
+    FT_CALIBRATION_MATRIX, FT_FILTER_ALPHA
+)
 
 
-# ---------------------------------------------------------------------
-# 데이터 모델
-# ---------------------------------------------------------------------
-@dataclass
-class FTReading:
-    """단일 핑거팁 F/T 센서 측정값"""
-    fx: float
-    fy: float
-    fz: float
-    tx: float
-    ty: float
-    tz: float
-
-    def as_dict(self) -> Dict[str, float]:
-        return asdict(self)
-
-
-@dataclass
-class FTFrame:
-    """전체 핑거팁 센서 프레임"""
-    sensors: Dict[int, FTReading]  # key: sensor_id (1~5)
-
-    def as_dict(self) -> Dict[int, Dict[str, float]]:
-        return {sid: reading.as_dict() for sid, reading in self.sensors.items()}
-
-
-# ---------------------------------------------------------------------
-# 예외 클래스
-# ---------------------------------------------------------------------
-class FTClientError(Exception):
-    """F/T 센서 통신 관련 예외"""
-    pass
-
-
-# ---------------------------------------------------------------------
-# 클라이언트
-# ---------------------------------------------------------------------
-class DGFingertipFTClient:
+class FTSensorClient:
     """
-    DG-5F-M 개발자 모드 F/T 센서 전용 TCP 클라이언트
-
-    프로토콜:
-      - Get Data: CMD=0x01
-      - F/T Sensor code: 0x05
-      - 요청 패킷 예: 00 04 01 05
-          Length(2) = 4 bytes total
-          CMD(1)    = 0x01
-          Data(1)   = 0x05  (F/T Sensor)
-
-    응답 패킷:
-      Length(2) + CMD(1) + [센서 데이터들]
-      센서 데이터는 1개당 12 bytes = 6 * int16
+    Force/Torque 센서와의 실시간 통신을 담당하는 클라이언트
+    gripper_client.py와 유사한 구조로 TCP 통신 구현
     """
-
-    CMD_GET_DATA = 0x01
-    DATA_FT = 0x05
-    CMD_SET_FT_OFFSET = 0x0B
-
-    def __init__(
-        self,
-        host: str,
-        port: int = 502,
-        timeout: float = 0.5,
-        num_sensors: int = 5,
-    ):
-        self.host = host
+    
+    def __init__(self, ip: str = FT_SENSOR_IP, port: int = FT_SENSOR_PORT):
+        """F/T 센서 클라이언트 초기화"""
+        self.ip = ip
         self.port = port
-        self.timeout = timeout
-        self.num_sensors = num_sensors
-        self.sock: Optional[socket.socket] = None
-
-    # ---------------------------
-    # 연결/해제
-    # ---------------------------
+        self.socket: Optional[socket.socket] = None
+        self.connected = False
+        
+        # 센서 데이터 저장 (gripper_client 패턴 유사)
+        self.raw_data = np.zeros(6)  # [Fx, Fy, Fz, Tx, Ty, Tz]
+        self.force = np.zeros(3)     # 캘리브레이션 적용된 힘
+        self.torque = np.zeros(3)    # 캘리브레이션 적용된 토크
+        
+        # 필터링된 데이터 (노이즈 제거용)
+        self.filtered_force = np.zeros(3)
+        self.filtered_torque = np.zeros(3)
+        
+        # 캘리브레이션 및 영점 조정
+        self.calibration_matrix = np.array(FT_CALIBRATION_MATRIX)
+        self.bias = np.zeros(6)
+        self.is_biased = False
+        
+        # 스레딩 (실시간 데이터 수집용)
+        self.reading_thread: Optional[threading.Thread] = None
+        self.stop_reading = threading.Event()
+        self.data_lock = threading.Lock()
+        
+        # 상태 모니터링
+        self.sample_count = 0
+        self.error_count = 0
+        self.last_update_time = time.time()
+        
+        # 로깅 설정
+        self.logger = logging.getLogger("FTSensor")
+    
     def connect(self) -> bool:
+        """
+        F/T 센서에 TCP 연결 (gripper_client.connect() 패턴 유사)
+        
+        Returns:
+            연결 성공 여부
+        """
         try:
-            self.sock = socket.create_connection(
-                (self.host, self.port),
-                timeout=self.timeout
-            )
-            self.sock.settimeout(self.timeout)
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(FT_TIMEOUT)
+            self.socket.connect((self.ip, self.port))
+            self.connected = True
+            self.logger.info(f"✓ F/T Sensor connected: {self.ip}:{self.port}")
             return True
-        except OSError as e:
-            self.sock = None
-            raise FTClientError(f"F/T 센서 클라이언트 연결 실패: {e}") from e
-
-    def close(self):
-        if self.sock is not None:
+            
+        except socket.error as e:
+            self.logger.error(f"✗ F/T Sensor connection failed: {e}")
+            self.connected = False
+            if self.socket:
+                self.socket.close()
+                self.socket = None
+            return False
+    
+    def disconnect(self):
+        """센서 연결 종료 (gripper_client.disconnect() 패턴)"""
+        self.stop_reading.set()
+        
+        # 읽기 스레드 종료 대기
+        if self.reading_thread and self.reading_thread.is_alive():
+            self.reading_thread.join(timeout=2.0)
+        
+        # 소켓 종료
+        if self.socket:
             try:
-                self.sock.close()
-            finally:
-                self.sock = None
-
-    def ensure_connected(self):
-        if self.sock is None:
-            raise FTClientError("소켓이 연결되어 있지 않습니다.")
-
-    # ---------------------------
-    # 저수준 유틸
-    # ---------------------------
-    def _recv_exact(self, size: int) -> bytes:
-        self.ensure_connected()
-        chunks = []
-        remaining = size
-
-        while remaining > 0:
-            chunk = self.sock.recv(remaining)
-            if not chunk:
-                raise FTClientError("소켓이 예기치 않게 종료되었습니다.")
-            chunks.append(chunk)
-            remaining -= len(chunk)
-
-        return b"".join(chunks)
-
-    def _send_packet(self, payload: bytes):
-        self.ensure_connected()
+                self.socket.close()
+            except:
+                pass
+            self.socket = None
+        
+        self.connected = False
+        self.logger.info("✓ F/T Sensor disconnected")
+    
+    def start_reading(self) -> bool:
+        """
+        백그라운드에서 센서 데이터 읽기 시작
+        메인 루프와 독립적으로 실시간 데이터 수집
+        """
+        if not self.connected:
+            self.logger.error("Cannot start reading: sensor not connected")
+            return False
+        
+        self.stop_reading.clear()
+        self.reading_thread = threading.Thread(
+            target=self._reading_loop,
+            daemon=True,
+            name="FTSensorReader"
+        )
+        self.reading_thread.start()
+        self.logger.info("✓ F/T Sensor reading started")
+        return True
+    
+    def _reading_loop(self):
+        """
+        센서 데이터 연속 읽기 루프 (백그라운드 스레드)
+        gripper_client의 명령 전송과 대응되는 데이터 수신 로직
+        """
+        while not self.stop_reading.is_set() and self.connected:
+            try:
+                # 센서 데이터 요청 (센서 프로토콜에 따라 수정 필요)
+                if hasattr(self, '_send_data_request'):
+                    self._send_data_request()
+                
+                # 데이터 수신 (일반적으로 6축 * 4바이트 = 24바이트)
+                raw_bytes = self._receive_exact_bytes(24)
+                if raw_bytes:
+                    self._parse_and_update_data(raw_bytes)
+                
+                # 샘플링 레이트 제어
+                time.sleep(1.0 / FT_SAMPLE_RATE)
+                
+            except socket.timeout:
+                continue
+            except Exception as e:
+                self.error_count += 1
+                self.logger.warning(f"F/T reading error: {e}")
+                
+                # 에러가 너무 많으면 중단
+                if self.error_count > 20:
+                    self.logger.error("Too many F/T sensor errors, stopping")
+                    break
+    
+    def _receive_exact_bytes(self, size: int) -> Optional[bytes]:
+        """
+        정확한 바이트 수만큼 수신 (gripper_client 패턴)
+        
+        Args:
+            size: 수신할 바이트 수
+            
+        Returns:
+            수신된 데이터 또는 None
+        """
+        if not self.socket:
+            return None
+        
+        data = b''
+        while len(data) < size:
+            try:
+                chunk = self.socket.recv(size - len(data))
+                if not chunk:
+                    raise ConnectionError("F/T sensor connection closed")
+                data += chunk
+            except socket.timeout:
+                return None
+            except Exception as e:
+                self.logger.error(f"Receive error: {e}")
+                return None
+        
+        return data
+    
+    def _parse_and_update_data(self, data: bytes):
+        """
+        수신된 바이너리 데이터를 파싱하고 내부 상태 업데이트
+        
+        Args:
+            data: 센서로부터 받은 원시 데이터 (24바이트)
+        """
         try:
-            self.sock.sendall(payload)
-        except OSError as e:
-            raise FTClientError(f"패킷 송신 실패: {e}") from e
-
-    def _recv_packet(self) -> bytes:
+            # 6개 float 언패킹 (센서 매뉴얼에 따라 엔디안 수정 필요)
+            # '!6f': 빅엔디안, 6개 float
+            # '<6f': 리틀엔디안, 6개 float  
+            raw_values = struct.unpack('!6f', data)
+            
+            with self.data_lock:
+                self.raw_data = np.array(raw_values)
+                
+                # 영점 보정 적용
+                if self.is_biased:
+                    corrected_data = self.raw_data - self.bias
+                else:
+                    corrected_data = self.raw_data
+                
+                # 캘리브레이션 매트릭스 적용
+                calibrated = self.calibration_matrix @ corrected_data
+                
+                # 힘과 토크 분리
+                self.force = calibrated[:3]
+                self.torque = calibrated[3:]
+                
+                # 지수 이동 평균 필터 적용
+                self.filtered_force = (
+                    FT_FILTER_ALPHA * self.force + 
+                    (1 - FT_FILTER_ALPHA) * self.filtered_force
+                )
+                self.filtered_torque = (
+                    FT_FILTER_ALPHA * self.torque + 
+                    (1 - FT_FILTER_ALPHA) * self.filtered_torque
+                )
+                
+                # 상태 업데이트
+                self.sample_count += 1
+                self.last_update_time = time.time()
+                
+        except struct.error as e:
+            self.logger.error(f"Data parsing error: {e}")
+            self.error_count += 1
+    
+    def get_force_torque(self, filtered: bool = True) -> Tuple[np.ndarray, np.ndarray]:
         """
-        공통 응답:
-        [Length(2 bytes)][Rest(length-2 bytes)]
+        현재 힘과 토크 값 반환 (gripper_client.get_status() 패턴 유사)
+        
+        Args:
+            filtered: True면 필터링된 값, False면 원시 값
+            
+        Returns:
+            (force[3], torque[3]) 튜플
         """
-        header = self._recv_exact(2)
-        total_len = struct.unpack(">H", header)[0]
-        if total_len < 3:
-            raise FTClientError(f"비정상 Length 수신: {total_len}")
-
-        body = self._recv_exact(total_len - 2)
-        return header + body
-
-    # ---------------------------
-    # 프로토콜 명령
-    # ---------------------------
-    def build_get_ft_packet(self) -> bytes:
+        with self.data_lock:
+            if filtered:
+                return self.filtered_force.copy(), self.filtered_torque.copy()
+            else:
+                return self.force.copy(), self.torque.copy()
+    
+    def get_magnitude(self) -> Tuple[float, float]:
         """
-        Get Data(0x01) with Data=0x05(F/T)
-        전체 길이 = 4 bytes
+        힘과 토크의 크기 반환 (안전 체크용)
+        
+        Returns:
+            (force_magnitude, torque_magnitude)
         """
-        total_len = 4
-        return struct.pack(">HBB", total_len, self.CMD_GET_DATA, self.DATA_FT)
-
-    def build_set_ft_offset_packet(self) -> bytes:
+        with self.data_lock:
+            force_mag = np.linalg.norm(self.filtered_force)
+            torque_mag = np.linalg.norm(self.filtered_torque)
+            return force_mag, torque_mag
+    
+    def set_bias(self):
         """
-        Set F/T Sensor Offset(0x0B)
-        전체 길이 = 3 bytes
+        현재 센서 값을 영점으로 설정 (무부하 상태에서 호출)
+        gripper_client의 캘리브레이션 기능과 유사
         """
-        total_len = 3
-        return struct.pack(">HB", total_len, self.CMD_SET_FT_OFFSET)
-
-    # ---------------------------
-    # 파싱
-    # ---------------------------
-    def parse_ft_response(self, packet: bytes) -> FTFrame:
+        with self.data_lock:
+            self.bias = self.raw_data.copy()
+            self.is_biased = True
+            self.logger.info("✓ F/T Sensor bias set (tared)")
+    
+    def clear_bias(self):
+        """영점 보정 해제"""
+        with self.data_lock:
+            self.bias = np.zeros(6)
+            self.is_biased = False
+            self.logger.info("✓ F/T Sensor bias cleared")
+    
+    def check_safety_limits(self) -> Tuple[bool, str]:
         """
-        응답 형식:
-          Length(2) + CMD(1) + sensor_data...
-        sensor_data는 센서당 12 bytes:
-          Fx, Fy, Fz, Tx, Ty, Tz (각각 int16, big-endian)
-        단위 환산:
-          Force  raw / 10.0  => N
-          Torque raw / 10.0  => Nm
+        안전 제한값 초과 여부 확인
+        
+        Returns:
+            (초과 여부, 경고 메시지)
         """
-        if len(packet) < 3:
-            raise FTClientError("응답 길이가 너무 짧습니다.")
-
-        total_len = struct.unpack(">H", packet[:2])[0]
-        cmd = packet[2]
-
-        if total_len != len(packet):
-            raise FTClientError(
-                f"Length 불일치: 헤더={total_len}, 실제={len(packet)}"
-            )
-
-        if cmd != self.CMD_GET_DATA:
-            raise FTClientError(f"예상하지 못한 CMD 응답: 0x{cmd:02X}")
-
-        payload = packet[3:]
-        expected_size = self.num_sensors * 12
-
-        if len(payload) < expected_size:
-            raise FTClientError(
-                f"F/T payload 크기 부족: 기대={expected_size}, 실제={len(payload)}"
-            )
-
-        sensors: Dict[int, FTReading] = {}
-
-        for i in range(self.num_sensors):
-            start = i * 12
-            chunk = payload[start:start + 12]
-
-            fx_raw, fy_raw, fz_raw, tx_raw, ty_raw, tz_raw = struct.unpack(">hhhhhh", chunk)
-
-            sensors[i + 1] = FTReading(
-                fx=fx_raw / 10.0,
-                fy=fy_raw / 10.0,
-                fz=fz_raw / 10.0,
-                tx=tx_raw / 10.0,
-                ty=ty_raw / 10.0,
-                tz=tz_raw / 10.0,
-            )
-
-        return FTFrame(sensors=sensors)
-
-    # ---------------------------
-    # 고수준 API
-    # ---------------------------
-    def read_ft_once(self) -> FTFrame:
+        force_mag, torque_mag = self.get_magnitude()
+        
+        if force_mag > MAX_FORCE_LIMIT:
+            return True, f"Force limit exceeded: {force_mag:.2f}N > {MAX_FORCE_LIMIT}N"
+        
+        if torque_mag > MAX_TORQUE_LIMIT:
+            return True, f"Torque limit exceeded: {torque_mag:.2f}Nm > {MAX_TORQUE_LIMIT}Nm"
+        
+        return False, "Safe"
+    
+    def get_connection_status(self) -> Dict:
         """
-        핑거팁 F/T 센서를 1회 읽는다.
+        연결 상태 및 통계 정보 반환 (gripper_client.get_status() 패턴)
+        
+        Returns:
+            상태 정보 딕셔너리
         """
-        packet = self.build_get_ft_packet()
-        self._send_packet(packet)
-        resp = self._recv_packet()
-        return self.parse_ft_response(resp)
+        with self.data_lock:
+            time_since_update = time.time() - self.last_update_time
+            data_rate = self.sample_count / max(time_since_update, 0.001)
+            
+            return {
+                'connected': self.connected,
+                'sample_count': self.sample_count,
+                'error_count': self.error_count,
+                'is_biased': self.is_biased,
+                'data_rate_hz': data_rate,
+                'time_since_update': time_since_update
+            }
 
-    def set_ft_offset(self):
-        """
-        현재 상태를 기준으로 F/T 센서 오프셋 설정
-        """
-        packet = self.build_set_ft_offset_packet()
-        self._send_packet(packet)
 
-    def read_ft_dict(self) -> Dict[int, Dict[str, float]]:
-        """
-        dict 형태로 반환
-        {
-            1: {"fx": ..., "fy": ..., ...},
-            ...
-            5: {...}
-        }
-        """
-        return self.read_ft_once().as_dict()
+# 센서별 프로토콜 적응을 위한 예시 (실제 센서에 맞게 수정)
+class ATIFTSensorClient(FTSensorClient):
+    """ATI Force/Torque 센서용 특화 클라이언트"""
+    
+    def _send_data_request(self):
+        """ATI 센서 데이터 요청 명령"""
+        if self.socket:
+            # ATI 센서는 보통 연속 스트리밍이므로 별도 요청 불필요
+            pass
+
+class RobotiqFTSensorClient(FTSensorClient):
+    """Robotiq Force/Torque 센서용 특화 클라이언트"""
+    
+    def _send_data_request(self):
+        """Robotiq 센서 데이터 요청 명령"""
+        if self.socket:
+            # Robotiq 특정 프로토콜에 따른 요청 명령
+            request_cmd = b'\x01\x04\x00\x00\x00\x06'  # 예시
+            self.socket.send(request_cmd)
