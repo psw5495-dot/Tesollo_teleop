@@ -1,3 +1,4 @@
+#ft_dashboard.py
 """
 Professional F/T Sensor Real-time Dashboard
 Tesollo Hand Teleoperation System용 전문 F/T 센서 모니터링
