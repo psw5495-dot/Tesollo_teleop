@@ -18,4 +18,5 @@ Tesollo/
 │   └── safety.py          # 안전 장치 및 제한
 └── ui/
     ├── __init__.py
-    └── visualization.py    # HUD 및 시각화
+    ├── visualization.py    # HUD 및 시각화
+    └── ft_dashboard.py    #ft_sensor 시각화
