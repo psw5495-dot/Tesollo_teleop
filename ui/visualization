@@ -388,3 +388,85 @@ class HUDManager:
             put_text_outline(frame, f"HUD Error: {str(e)}", (10, 30),
                              color=(0, 0, 255))
             return frame
+
+
+def draw_ft_sensor_panel(self, frame, force, torque, max_force, max_torque):
+    """F/T 센서 데이터를 화면에 표시"""
+    h, w = frame.shape[:2]
+    
+    # F/T 패널 위치 (우측 하단)
+    panel_x, panel_y = w - 320, h - 200
+    panel_w, panel_h = 300, 180
+    
+    # 배경 그리기
+    cv2.rectangle(frame, (panel_x, panel_y), 
+                  (panel_x + panel_w, panel_y + panel_h),
+                  (20, 20, 20), -1)
+    cv2.rectangle(frame, (panel_x, panel_y), 
+                  (panel_x + panel_w, panel_y + panel_h),
+                  (100, 100, 100), 2)
+    
+    # 제목
+    cv2.putText(frame, "F/T Sensor", (panel_x + 10, panel_y + 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    
+    # 힘 데이터
+    force_mag = np.linalg.norm(force)
+    force_ratio = min(force_mag / max_force, 1.0)
+    
+    # 색상 결정 (안전: 녹색, 경고: 노랑, 위험: 빨강)
+    if force_ratio < 0.7:
+        force_color = (0, 255, 0)  # 녹색
+    elif force_ratio < 0.9:
+        force_color = (0, 255, 255)  # 노랑
+    else:
+        force_color = (0, 0, 255)  # 빨강
+    
+    # 힘 표시
+    y_pos = panel_y + 60
+    cv2.putText(frame, f"Force: {force_mag:.1f}N", 
+                (panel_x + 10, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, force_color, 2)
+    
+    # 힘 바 그래프
+    bar_y = y_pos + 10
+    bar_width = int(280 * force_ratio)
+    cv2.rectangle(frame, (panel_x + 10, bar_y), 
+                  (panel_x + 10 + bar_width, bar_y + 15),
+                  force_color, -1)
+    cv2.rectangle(frame, (panel_x + 10, bar_y), 
+                  (panel_x + 290, bar_y + 15),
+                  (100, 100, 100), 1)
+    
+    # 토크 데이터
+    torque_mag = np.linalg.norm(torque)
+    torque_ratio = min(torque_mag / max_torque, 1.0)
+    
+    if torque_ratio < 0.7:
+        torque_color = (0, 255, 0)
+    elif torque_ratio < 0.9:
+        torque_color = (0, 255, 255)
+    else:
+        torque_color = (0, 0, 255)
+    
+    # 토크 표시
+    y_pos = bar_y + 40
+    cv2.putText(frame, f"Torque: {torque_mag:.2f}Nm", 
+                (panel_x + 10, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, torque_color, 2)
+    
+    # 토크 바 그래프
+    bar_y = y_pos + 10
+    bar_width = int(280 * torque_ratio)
+    cv2.rectangle(frame, (panel_x + 10, bar_y), 
+                  (panel_x + 10 + bar_width, bar_y + 15),
+                  torque_color, -1)
+    cv2.rectangle(frame, (panel_x + 10, bar_y), 
+                  (panel_x + 290, bar_y + 15),
+                  (100, 100, 100), 1)
+    
+    # 상태 메시지
+    if force_ratio > 0.9 or torque_ratio > 0.9:
+        cv2.putText(frame, "⚠ HIGH FORCE/TORQUE", 
+                    (panel_x + 10, panel_y + panel_h - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
