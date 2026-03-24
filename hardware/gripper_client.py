@@ -164,3 +164,5 @@ class DG5FDevClient:
             logger.error(f"F/T offset set failed: {e}")
             raise
 
+GripperClient = DG5FDevClient
+__all__ = ["GripperClient","DG5FDevClient"]
