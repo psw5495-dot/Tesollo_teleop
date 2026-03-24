@@ -1,357 +1,358 @@
-#!/usr/bin/env python3
-#main.py
 """
-DG-5F-M 개발자 모드 텔레오퍼레이션
-메인 애플리케이션 진입점
+Tesollo Hand Teleoperation System with F/T Sensor Integration
 """
-import time
+
 import cv2
-import logging
-import sys
+import time
 import numpy as np
-from typing import Dict, Optional
-from ui.ft_dashboard import FTDashboard
-from hardware.ft_sensor_client import FTSensorClient  # 또는 실제 클래스명
-from ui.ft_dashboard import FTDashboard
+import sys
+import os
 
+# 모듈 경로 설정
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# 로컬 모듈 임포트
-from config.constants import (
-    GRIPPER_IP, GRIPPER_PORT, MODEL_PATH,
-    CONTROL_HZ, DT, GLOBAL_LIMITS, BASE_ANGLES
-)
-from hardware.gripper_client import DG5FDevClient
-from vision.hand_tracker import HandTrackerTasks
-from control.motor_controller import MotorController
-from control.safety import make_zero_duty, apply_global_limits
-from ui.visualization import HUDManager
+# Hardware imports
+try:
+    from hardware.gripper_client import GripperClient
+    from hardware.ft_sensor_client import FTSensorClient  # 수정된 경로
+except ImportError as e:
+    print(f"❌ Hardware import error: {e}")
+    sys.exit(1)
 
-# 로깅 설정
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Vision imports
+try:
+    from vision.hand_tracker import HandTracker
+except ImportError as e:
+    print(f"❌ Vision import error: {e}")
+    sys.exit(1)
+
+# Control imports
+try:
+    from control.motor_controller import MotorController
+    from control.safety import SafetyController
+except ImportError as e:
+    print(f"❌ Control import error: {e}")
+    sys.exit(1)
+
+# UI imports
+try:
+    from ui.visualization import Visualizer
+    from ui.ft_dashboard import FTDashboard
+except ImportError as e:
+    print(f"❌ UI import error: {e}")
+    sys.exit(1)
+
+# Constants
+try:
+    from config.constants import (
+        CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT,
+        MAX_FORCE_LIMIT, MAX_TORQUE_LIMIT, LOOP_RATE
+    )
+except ImportError as e:
+    print(f"❌ Constants import error: {e}")
+    # 기본값 사용
+    CAMERA_INDEX = 0
+    CAMERA_WIDTH = 640
+    CAMERA_HEIGHT = 480
+    LOOP_RATE = 1/30
+    MAX_FORCE_LIMIT = 50.0
+    MAX_TORQUE_LIMIT = 5.0
 
 
 class TeleopSystem:
+    """Tesollo Hand Teleoperation System with F/T Sensor"""
+    
     def __init__(self):
+        print("="*60)
+        print("TESOLLO HAND TELEOPERATION SYSTEM")
+        print("with Force/Torque Sensor Integration")
+        print("="*60)
+        
         self.running = True
         self.emergency_stop = False
-
-        # 카메라 초기화
-        self.camera = cv2.VideoCapture(0)
-
-        # F/T 센서 및 대시보드 초기화 (안전한 방식)
+        self.ft_sensor_enabled = False
+        
+        # 컴포넌트 초기화
+        print("\n[1/7] Initializing camera...")
+        self.camera = cv2.VideoCapture(CAMERA_INDEX)
+        if not self.camera.isOpened():
+            print("❌ Failed to open camera")
+            sys.exit(1)
+        
+        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        print("✓ Camera initialized")
+        
+        print("\n[2/7] Initializing hand tracker...")
+        self.hand_tracker = HandTracker()
+        print("✓ Hand tracker initialized")
+        
+        print("\n[3/7] Initializing motor controller...")
+        self.motor_controller = MotorController()
+        print("✓ Motor controller initialized")
+        
+        print("\n[4/7] Initializing safety controller...")
+        self.safety = SafetyController()
+        print("✓ Safety controller initialized")
+        
+        print("\n[5/7] Initializing visualizer...")
+        self.visualizer = Visualizer()
+        print("✓ Visualizer initialized")
+        
+        print("\n[6/7] Initializing gripper client...")
+        self.gripper = GripperClient()
+        print("✓ Gripper client initialized")
+        
+        print("\n[7/7] Initializing F/T sensor system...")
         try:
             self.ft_sensor = FTSensorClient()
             self.ft_dashboard = FTDashboard(width=1000, height=700)
-            self.ft_sensor_enabled = False
-            print("✓ F/T 시스템 객체 생성됨")
+            print("✓ F/T sensor system initialized")
         except Exception as e:
-            print(f"⚠ F/T 시스템 초기화 경고: {e}")
+            print(f"⚠ F/T sensor initialization warning: {e}")
             self.ft_sensor = None
             self.ft_dashboard = None
-            self.ft_sensor_enabled = False
-
-    def initialize_hardware(self):
-        """하드웨어 초기화"""
-        print("하드웨어 초기화 중...")
-
-        # F/T 센서 연결 시도
+        
+        print("\n✓ All systems initialized\n")
+    
+    def initialize_hardware(self) -> bool:
+        """하드웨어 연결 및 초기화"""
+        print("="*60)
+        print("HARDWARE CONNECTION")
+        print("="*60)
+        
+        # Gripper 연결
+        print("\n[1/2] Connecting to gripper...")
+        if not self.gripper.connect():
+            print("⚠ Gripper connection failed (continuing anyway)")
+        else:
+            print("✓ Gripper connected")
+        
+        # F/T 센서 연결
+        print("\n[2/2] Connecting to F/T sensor...")
         if self.ft_sensor:
             try:
                 if self.ft_sensor.connect():
                     if self.ft_sensor.start_reading():
-                        print("✓ F/T 센서 연결 및 읽기 시작")
-                        time.sleep(1.0)  # 안정화 대기
-                        self.ft_sensor.set_bias()  # 영점 설정
+                        print("✓ F/T sensor connected and reading started")
+                        
+                        # 안정화 대기
+                        print("  Waiting for sensor stabilization...")
+                        time.sleep(2.0)
+                        
+                        # 영점 설정
+                        self.ft_sensor.set_bias()
+                        print("  ✓ Sensor bias set (tared)")
+                        
                         self.ft_sensor_enabled = True
+                        
+                        # 센서 상태 확인
+                        status = self.ft_sensor.get_connection_status()
+                        if status['simulation_mode']:
+                            print("  ℹ Running in SIMULATION mode")
+                        else:
+                            print(f"  ℹ Connected to physical sensor at {self.ft_sensor.ip}")
                     else:
-                        print("⚠ F/T 센서 연결됨, 하지만 읽기 실패")
+                        print("⚠ F/T sensor connected but reading failed")
                 else:
-                    print("⚠ F/T 센서 연결 실패 (시뮬레이션 모드)")
+                    print("⚠ F/T sensor connection failed")
             except Exception as e:
-                print(f"⚠ F/T 센서 에러: {e}")
-
+                print(f"⚠ F/T sensor error: {e}")
+        
+        print("\n✓ Hardware initialization complete\n")
         return True
-
+    
     def main_control_loop(self):
         """메인 제어 루프"""
-        print("제어 루프 시작...")
-        print("조작법: Q-종료, Z-센서영점재설정, R-비상정지해제")
-
+        print("="*60)
+        print("STARTING TELEOPERATION")
+        print("="*60)
+        print("\nControls:")
+        print("  Q - Quit system")
+        print("  Z - Re-bias F/T sensor")
+        print("  R - Reset emergency stop")
+        print("  S - Print system status")
+        print("="*60 + "\n")
+        
         while self.running:
-            # 카메라 프레임 읽기
+            loop_start = time.time()
+            
+            # 1. 카메라 프레임 읽기
             ret, frame = self.camera.read()
             if not ret:
                 continue
-
-            # F/T 센서 데이터 처리
+            
+            # 2. 손 추적
+            hand_data = self.hand_tracker.process(frame)
+            
+            # 3. F/T 센서 데이터 처리
+            ft_safe = True
             if self.ft_sensor_enabled and self.ft_sensor:
                 try:
                     # 센서 데이터 가져오기
                     force, torque = self.ft_sensor.get_force_torque(filtered=True)
-
-                    # 대시보드 데이터 업데이트
+                    
+                    # 대시보드 업데이트
                     if self.ft_dashboard:
                         self.ft_dashboard.update_data(force, torque)
-
+                    
                     # 안전 체크
                     exceeded, safety_msg = self.ft_sensor.check_safety_limits()
                     if exceeded and not self.emergency_stop:
-                        print(f"🚨 {safety_msg}")
+                        print(f"🚨 SAFETY ALERT: {safety_msg}")
                         self.emergency_stop = True
-
+                        ft_safe = False
+                        
+                        # 그리퍼 정지
+                        if self.gripper.connected:
+                            self.gripper.stop_all_motors()
+                
                 except Exception as e:
-                    print(f"⚠ F/T 처리 에러: {e}")
-
-            # 화면 표시 (핵심: 모든 imshow를 메인 스레드에서 처리)
+                    print(f"⚠ F/T processing error: {e}")
+            
+            # 4. 모터 제어 (안전할 때만)
+            if hand_data and ft_safe and not self.emergency_stop:
+                try:
+                    motor_commands = self.motor_controller.compute_commands(hand_data)
+                    safe_commands = self.safety.validate_commands(motor_commands)
+                    
+                    if self.gripper.connected:
+                        self.gripper.send_commands(safe_commands)
+                except Exception as e:
+                    print(f"⚠ Motor control error: {e}")
+            
+            # 5. 화면 표시 (핵심: 모든 imshow를 메인 스레드에서 처리)
             try:
                 # 메인 카메라 화면
-                self._draw_main_info(frame)
+                self._draw_main_overlay(frame, hand_data)
                 cv2.imshow("Tesollo Hand Teleoperation", frame)
-
-                # F/T 대시보드 화면 (별도 창)
+                
+                # F/T 대시보드 (별도 창)
                 if self.ft_dashboard:
                     dashboard_frame = self.ft_dashboard.get_dashboard_frame()
                     cv2.imshow("F/T Sensor Dashboard", dashboard_frame)
-
+                    
             except Exception as e:
-                print(f"⚠ 화면 표시 에러: {e}")
-
-            # 키 입력 처리
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('z') and self.ft_sensor_enabled:
-                self.ft_sensor.set_bias()
-                print("✓ F/T 센서 영점 재설정")
-            elif key == ord('r'):
-                if self.emergency_stop:
-                    self.emergency_stop = False
-                    print("✓ 비상 정지 해제")
-
-    def _draw_main_info(self, frame):
-        """메인 화면에 상태 정보 표시"""
-        h, w = frame.shape[:2]
-
-        # 상태 바 배경
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (w, 50), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-
-        # F/T 센서 상태
-        if self.ft_sensor_enabled:
-            status_color = (0, 0, 255) if self.emergency_stop else (0, 255, 0)
-            status_text = "E-STOP" if self.emergency_stop else "ACTIVE"
-            cv2.putText(frame, f"F/T: {status_text}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-        else:
-            cv2.putText(frame, "F/T: OFFLINE", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 100), 2)
-
-    def shutdown(self):
-        """시스템 종료"""
-        print("시스템 종료 중...")
-
-        if self.ft_sensor_enabled and self.ft_sensor:
-            self.ft_sensor.disconnect()
-
-        if self.camera:
-            self.camera.release()
-
-        cv2.destroyAllWindows()
-        print("✓ 종료 완료")
-
-
-class TeleopSystem:
-    def __init__(self):
-        # ... 기존 초기화 ...
-
-        # F/T 대시보드 추가
-        self.ft_dashboard = FTDashboard(
-            width=1000,
-            height=700,
-            history_length=300  # 10초 히스토리
-        )
-
-    def initialize_hardware(self) -> bool:
-        """하드웨어 초기화"""
-        print("Initializing hardware components...")
-
-        # 1. 기존 하드웨어 초기화 (gripper, camera 등)
-        # ... 기존 코드 ...
-
-        # 2. F/T 센서 초기화
-        if self.ft_sensor.connect():
-            if self.ft_sensor.start_reading():
-                time.sleep(1.0)  # 센서 안정화 대기
-                self.ft_sensor.set_bias()  # 영점 설정
-                self.ft_sensor_enabled = True
-
-                # F/T 대시보드 시작
-                self.ft_dashboard.start()
-                print("✓ F/T Sensor and Dashboard initialized")
-            else:
-                print("⚠ F/T Sensor connected but failed to start reading")
-        else:
-            print("⚠ F/T Sensor not available")
-            self.ft_sensor_enabled = False
-
-        return True
-
-    def main_control_loop(self):
-        """메인 제어 루프"""
-        print("Starting teleoperation with F/T monitoring...")
-
-        while self.running:
-            loop_start = time.time()
-
-            # 1. 카메라 프레임 읽기
-            frame = self.camera.read()
-            if frame is None:
-                continue
-
-            # 2. 손 추적 처리
-            hand_data = self.hand_tracker.process(frame)
-
-            # 3. F/T 센서 데이터 처리
-            ft_safe = True
-            if self.ft_sensor_enabled:
-                # 실시간 F/T 데이터 가져오기
-                force, torque = self.ft_sensor.get_force_torque(filtered=True)
-
-                # 🎯 대시보드 업데이트 (핵심!)
-                self.ft_dashboard.update_data(force, torque)
-
-                # 안전 체크
-                exceeded, safety_msg = self.ft_sensor.check_safety_limits()
-                if exceeded:
-                    print(f"⚠ {safety_msg}")
-                    ft_safe = False
-
-                    # 비상 정지
-                    if self.ft_dashboard.get_dashboard_status()['emergency_state']:
-                        self.emergency_stop = True
-                        self.gripper.stop_all_motors()
-                        print("🚨 EMERGENCY STOP activated by F/T limits!")
-
-            # 4. 모터 제어 (안전할 때만)
-            if hand_data and ft_safe and not self.emergency_stop:
-                motor_commands = self.motor_controller.compute_commands(hand_data)
-                safe_commands = self.safety.validate_commands(motor_commands)
-                self.gripper.send_commands(safe_commands)
-
-            # 5. 메인 화면 표시 (기존 카메라 창)
-            self.visualizer.update_main_display(frame, hand_data, self.emergency_stop)
-            cv2.imshow("Tesollo Hand Teleoperation", frame)
-
+                print(f"⚠ Display error: {e}")
+            
             # 6. 키보드 입력 처리
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
+                print("\n⚠ Quit requested by user")
                 break
             elif key == ord('z') and self.ft_sensor_enabled:
-                # F/T 센서 영점 재설정
                 self.ft_sensor.set_bias()
-                print("✓ F/T Sensor re-biased")
+                print("✓ F/T sensor re-biased")
             elif key == ord('r'):
-                # 비상 정지 해제 및 통계 리셋
                 if self.emergency_stop:
                     self.emergency_stop = False
                     print("✓ Emergency stop reset")
-                if self.ft_sensor_enabled:
-                    self.ft_dashboard._reset_statistics()
             elif key == ord('s'):
-                # 시스템 상태 출력
                 self._print_system_status()
-
+            
             # 7. 루프 타이밍 (30fps 유지)
             loop_time = time.time() - loop_start
-            if loop_time < 1.0 / 30.0:
-                time.sleep(1.0 / 30.0 - loop_time)
-
-    def _print_system_status(self):
-        """상세 시스템 상태 출력"""
-        print("\n" + "=" * 50)
-        print("TESOLLO TELEOPERATION SYSTEM STATUS")
-        print("=" * 50)
-
-        # F/T 대시보드 상태
+            if loop_time < LOOP_RATE:
+                time.sleep(LOOP_RATE - loop_time)
+    
+    def _draw_main_overlay(self, frame, hand_data):
+        """메인 화면 오버레이"""
+        h, w = frame.shape[:2]
+        
+        # 반투명 상태 바
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, 60), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+        
+        # F/T 센서 상태 표시
         if self.ft_sensor_enabled:
-            dashboard_status = self.ft_dashboard.get_dashboard_status()
             force_mag, torque_mag = self.ft_sensor.get_magnitude()
-
-            print(f"F/T Sensor: ✓ Active")
-            print(f"  Current Force: {force_mag:.2f}N (Max: {MAX_FORCE_LIMIT}N)")
-            print(f"  Current Torque: {torque_mag:.3f}Nm (Max: {MAX_TORQUE_LIMIT}Nm)")
-            print(f"  Dashboard: {'✓ Running' if dashboard_status['running'] else '✗ Stopped'}")
-            print(f"  Emergency State: {'🚨 ACTIVE' if dashboard_status['emergency_state'] else '✓ Normal'}")
-            print(f"  Max Recorded Force: {dashboard_status['max_force_recorded']:.2f}N")
-            print(f"  Max Recorded Torque: {dashboard_status['max_torque_recorded']:.3f}Nm")
+            
+            if self.emergency_stop:
+                status_color = (0, 0, 255)  # Red
+                status_text = "E-STOP"
+            elif force_mag > MAX_FORCE_LIMIT * 0.8:
+                status_color = (0, 255, 255)  # Yellow
+                status_text = "WARNING"
+            else:
+                status_color = (0, 255, 0)  # Green
+                status_text = "ACTIVE"
+            
+            cv2.putText(frame, f"F/T: {status_text}", (10, 35),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+            
+            # 현재 값 표시
+            cv2.putText(frame, f"F:{force_mag:.1f}N T:{torque_mag:.2f}Nm", 
+                       (200, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
         else:
-            print(f"F/T Sensor: ✗ Not Available")
-
-        # 그리퍼 상태
-        print(f"Gripper: {'✓ Connected' if self.gripper.connected else '✗ Disconnected'}")
-
-        # 전체 시스템 상태
+            cv2.putText(frame, "F/T: OFFLINE", (10, 35),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
+    
+    def _print_system_status(self):
+        """시스템 상태 출력"""
+        print("\n" + "="*60)
+        print("SYSTEM STATUS")
+        print("="*60)
+        
+        if self.ft_sensor_enabled:
+            status = self.ft_sensor.get_connection_status()
+            force_mag, torque_mag = self.ft_sensor.get_magnitude()
+            
+            print(f"\nF/T Sensor: ✓ Active")
+            print(f"  Mode: {'Simulation' if status['simulation_mode'] else 'Physical'}")
+            print(f"  Force: {force_mag:.2f}N (Max: {MAX_FORCE_LIMIT}N)")
+            print(f"  Torque: {torque_mag:.3f}Nm (Max: {MAX_TORQUE_LIMIT}Nm)")
+            print(f"  Sample Rate: {status['data_rate_hz']:.1f} Hz")
+        else:
+            print(f"\nF/T Sensor: ✗ Not Available")
+        
+        print(f"\nGripper: {'✓ Connected' if self.gripper.connected else '✗ Disconnected'}")
         print(f"Emergency Stop: {'🚨 ACTIVE' if self.emergency_stop else '✓ Inactive'}")
-        print("=" * 50 + "\n")
-
+        print("="*60 + "\n")
+    
     def shutdown(self):
         """시스템 종료"""
-        print("Shutting down Tesollo Teleoperation System...")
-
-        # F/T 대시보드 종료
-        if hasattr(self, 'ft_dashboard'):
-            self.ft_dashboard.stop()
-
-        # F/T 센서 종료
-        if self.ft_sensor_enabled:
+        print("\n" + "="*60)
+        print("SHUTTING DOWN SYSTEM")
+        print("="*60)
+        
+        if self.ft_sensor_enabled and self.ft_sensor:
+            print("\nDisconnecting F/T sensor...")
             self.ft_sensor.disconnect()
-
-        # 기존 하드웨어 종료
-        if hasattr(self, 'gripper'):
+        
+        if self.gripper and self.gripper.connected:
+            print("Disconnecting gripper...")
             self.gripper.disconnect()
-
-        # 모든 OpenCV 창 닫기
+        
+        if self.camera:
+            self.camera.release()
         cv2.destroyAllWindows()
-
-        print("✓ System shutdown complete")
+        
+        print("\n✓ System shutdown complete")
 
 
 def main():
-    """애플리케이션 진입점"""
-    try:
-        app = TeleopSystem()
-
-        if not app.initialize():
-            logger.error("초기화 실패")
-            return 1
-
-        app.run()
-        return 0
-
-    except Exception as e:
-        logger.error(f"애플리케이션 실행 실패: {e}")
-        return 1
-
-
-if __name__ == "__main__":
+    """메인 실행 함수"""
     system = None
+    
     try:
         system = TeleopSystem()
+        
         if system.initialize_hardware():
             system.main_control_loop()
         else:
-            print("❌ 하드웨어 초기화 실패")
+            print("❌ Hardware initialization failed")
+            
     except KeyboardInterrupt:
-        print("\n사용자에 의한 중단")
+        print("\n⚠ Interrupted by user (Ctrl+C)")
     except Exception as e:
-        print(f"❌ 시스템 에러: {e}")
+        print(f"\n❌ System error: {e}")
         import traceback
         traceback.print_exc()
     finally:
         if system:
             system.shutdown()
+
+
+if __name__ == "__main__":
+    main()
