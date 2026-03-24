@@ -1,245 +1,321 @@
-#hand_tracker.py
 """
-MediaPipe를 사용한 핸드 트래킹 및 특징 추출
+MediaPipe Hand Tracker - Tasks API Version
+High-performance implementation with .task model file
 """
-import os
-import math
+
 import cv2
 import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-from typing import Optional, Tuple, Dict, List
-import logging
+from mediapipe.framework.formats import landmark_pb2
+from typing import Optional, Dict
+import os
 
-from config.constants import FINGER_ORDER, FINGER_LANDMARKS
+# Constants import with fallback
+try:
+    from config.constants import (
+        HAND_LANDMARKER_MODEL_PATH,
+        MAX_NUM_HANDS,
+        MIN_HAND_DETECTION_CONFIDENCE,
+        MIN_HAND_PRESENCE_CONFIDENCE,
+        MIN_TRACKING_CONFIDENCE
+    )
+except ImportError:
+    # 기본값 사용
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    HAND_LANDMARKER_MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "hand_landmarker.task")
+    MAX_NUM_HANDS = 1
+    MIN_HAND_DETECTION_CONFIDENCE = 0.5
+    MIN_HAND_PRESENCE_CONFIDENCE = 0.5
+    MIN_TRACKING_CONFIDENCE = 0.5
 
-logger = logging.getLogger(__name__)
 
-
-class HandTrackerTasks:
-    """핸드 랜드마크 감지 및 특징 추출 클래스"""
-
-    def __init__(self, model_path: str):
+class HandTracker:
+    """
+    MediaPipe Tasks API 기반 손 추적
+    .task 모델 파일 사용 - 고성능, 최신 기능
+    """
+    
+    def __init__(self, model_path: str = HAND_LANDMARKER_MODEL_PATH):
+        """
+        Tasks API 손 추적기 초기화
+        
+        Args:
+            model_path: .task 모델 파일 경로
+        """
+        print(f"Initializing MediaPipe Hand Tracker (Tasks API)...")
+        print(f"Model path: {model_path}")
+        
+        # 모델 파일 존재 확인
         if not os.path.exists(model_path):
-            raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {model_path}")
-
+            raise FileNotFoundError(
+                f"Hand landmarker model not found at: {model_path}\n"
+                f"Please download the model file and place it in the models/ folder.\n"
+                f"Download URL: https://storage.googleapis.com/mediapipe-models/"
+                f"hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+            )
+        
+        # Tasks API 옵션 설정
         base_options = python.BaseOptions(model_asset_path=model_path)
         options = vision.HandLandmarkerOptions(
             base_options=base_options,
-            num_hands=1,
-            min_hand_detection_confidence=0.5,
-            min_hand_presence_confidence=0.5,
-            min_tracking_confidence=0.5
+            running_mode=vision.RunningMode.VIDEO,  # 실시간 비디오 처리 최적화
+            num_hands=MAX_NUM_HANDS,
+            min_hand_detection_confidence=MIN_HAND_DETECTION_CONFIDENCE,
+            min_hand_presence_confidence=MIN_HAND_PRESENCE_CONFIDENCE,
+            min_tracking_confidence=MIN_TRACKING_CONFIDENCE
         )
-
-        self.detector = vision.HandLandmarker.create_from_options(options)
-        logger.info("핸드 트래커 초기화 완료")
-
-    def process(self, frame_bgr: np.ndarray) -> Tuple[
-        np.ndarray, Optional[Dict], Optional[Dict], Optional[Tuple], Optional[List]]:
-        """
-        프레임 처리 및 손 특징 추출
-
-        Returns:
-            Tuple of (annotated_frame, curls, splay, thumb_pair, landmarks_xy)
-        """
-        h, w = frame_bgr.shape[:2]
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
-        try:
-            result = self.detector.detect(mp_img)
-        except Exception as e:
-            logger.error(f"핸드 트래킹 처리 실패: {e}")
-            return frame_bgr, None, None, None, None
-
-        if not result.hand_landmarks:
-            return frame_bgr, None, None, None, None
-
-        # 왼손만 필터링 (프레임이 플립되어 있어서 "Right"가 실제 왼손)
-        hand_idx = None
-        if hasattr(result, "handedness") and result.handedness:
-            for idx, handed_list in enumerate(result.handedness):
-                if handed_list and len(handed_list) > 0:
-                    label = handed_list[0].category_name
-                    if label == "Right":
-                        hand_idx = idx
-                        break
-
-        if hand_idx is None:
-            return frame_bgr, None, None, None, None
-
-        landmarks = result.hand_landmarks[hand_idx]
-        landmarks_np = np.array([[p.x, p.y, p.z] for p in landmarks], dtype=np.float32)
-        landmarks_xy = [(int(p.x * w), int(p.y * h)) for p in landmarks]
-
-        self._draw_landmarks(frame_bgr, landmarks_xy)
-
-        # 특징 계산
-        curls = {f: self._calculate_finger_curl(landmarks_np, f) for f in FINGER_ORDER}
-        splay = self._compute_splay_degrees(landmarks_np)
-        thumb_mcp_curl, thumb_ip_curl = self._calculate_thumb_curls(landmarks_np)
-
-        # 엄지 대립(Opposition) 계산 추가
-        thumb_opposition = self._calculate_thumb_opposition(landmarks_np)
-
-        # 3개 값으로 반환
-        return frame_bgr, curls, splay, (thumb_mcp_curl, thumb_ip_curl, thumb_opposition), landmarks_xy
-
-    def _calculate_thumb_opposition(self, landmarks: np.ndarray) -> float:
-        """
-        엄지 대립(Opposition) 정도 계산
-        엄지 끝과 새끼 기저부 사이의 거리를 기반으로 계산
-
-        Returns:
-            opposition 값 (0.0: 완전 펼침, 1.0: 완전 대립)
-        """
-        thumb_tip = landmarks[4]  # 엄지 끝
-        pinky_mcp = landmarks[17]  # 새끼 MCP
-        wrist = landmarks[0]  # 손목
-
-        # 정규화를 위한 기준 거리 (손목-새끼MCP)
-        reference_distance = np.linalg.norm(pinky_mcp - wrist)
-        if reference_distance < 1e-9:
-            return 0.0
-
-        # 엄지 끝과 새끼 MCP 사이의 거리
-        thumb_pinky_distance = np.linalg.norm(thumb_tip - pinky_mcp)
-
-        # 정규화된 거리
-        normalized_distance = thumb_pinky_distance / reference_distance
-
-        # 거리 기반 Opposition 계산 (실험적 값, 튜닝 필요)
-        max_distance = 1.2  # 완전히 펼쳤을 때
-        min_distance = 0.3  # 완전히 붙였을 때
-
-        # 거리가 가까울수록 Opposition 값이 높아짐
-        opposition = 1.0 - np.clip(
-            (normalized_distance - min_distance) / (max_distance - min_distance),
-            0.0, 1.0
-        )
-
-        # 디버깅용 출력 (초기 테스트 시)
-        # print(f"Opposition: {opposition:.3f}")
-
-        return float(opposition)
-
-    @staticmethod
-    def _calculate_angle_degrees(v1: np.ndarray, v2: np.ndarray) -> float:
-        """두 벡터 간의 각도를 도 단위로 계산"""
-        dot_product = float(np.dot(v1, v2))
-        norm1 = float(np.linalg.norm(v1))
-        norm2 = float(np.linalg.norm(v2))
-
-        if norm1 < 1e-9 or norm2 < 1e-9:
-            return 180.0
-
-        cos_angle = np.clip(dot_product / (norm1 * norm2), -1.0, 1.0)
-        return math.degrees(math.acos(cos_angle))
-
-    @staticmethod
-    def _curl_from_joint_angle(angle_deg: float, open_deg: float = 170.0, closed_deg: float = 70.0) -> float:
-        """관절 각도를 컬 값 [0,1]로 변환"""
-        curl = (open_deg - angle_deg) / (open_deg - closed_deg)
-        return float(np.clip(curl, 0.0, 1.0))
-
-    def _calculate_finger_curl(self, landmarks: np.ndarray, finger: str) -> float:
-        """손가락 컬 값 계산"""
-        indices = FINGER_LANDMARKS[finger]
-        points = [landmarks[i] for i in indices]
-
-        if finger == "finger1":  # 엄지
-            wrist = landmarks[0]
-            tip = landmarks[4]
-            reference = landmarks[2]
-            current_distance = np.linalg.norm(tip - wrist)
-            max_distance = np.linalg.norm(reference - wrist) * 1.4
-
-            if max_distance < 1e-9:
-                return 0.0
-
-            curl = 1.0 - min(current_distance / max_distance, 1.0)
-            return float(np.clip(curl, 0.0, 1.0))
-
-        # 다른 손가락들
-        mcp, pip, dip, tip = points
-        pip_angle = self._calculate_angle_degrees(mcp - pip, dip - pip)
-        dip_angle = self._calculate_angle_degrees(pip - dip, tip - dip)
-        average_angle = 0.6 * pip_angle + 0.4 * dip_angle
-
-        return self._curl_from_joint_angle(average_angle)
-
-    def _calculate_thumb_curls(self, landmarks: np.ndarray) -> Tuple[float, float]:
-        """엄지 MCP 및 IP 컬 값 계산"""
-        p1, p2, p3, p4 = landmarks[1], landmarks[2], landmarks[3], landmarks[4]
-        mcp_angle = self._calculate_angle_degrees(p1 - p2, p3 - p2)
-        ip_angle = self._calculate_angle_degrees(p2 - p3, p4 - p3)
-
-        return (self._curl_from_joint_angle(mcp_angle),
-                self._curl_from_joint_angle(ip_angle))
-
-    @staticmethod
-    def _normalize_2d_vector(v: np.ndarray) -> np.ndarray:
-        """2D 벡터 정규화"""
-        norm = float(np.linalg.norm(v))
-        return v / (norm + 1e-9)
-
-    @staticmethod
-    def _signed_angle_2d(a: np.ndarray, b: np.ndarray) -> float:
-        """2D 벡터 간의 부호 있는 각도 계산"""
-        a_norm = HandTrackerTasks._normalize_2d_vector(a)
-        b_norm = HandTrackerTasks._normalize_2d_vector(b)
-        return math.degrees(math.atan2(a_norm[0] * b_norm[1] - a_norm[1] * b_norm[0],
-                                       a_norm[0] * b_norm[0] + a_norm[1] * b_norm[1]))
-
-    @staticmethod
-    def _finger_direction_2d(landmarks: np.ndarray, mcp_idx: int, tip_idx: int) -> np.ndarray:
-        """2D 손가락 방향 벡터 계산"""
-        direction = landmarks[tip_idx] - landmarks[mcp_idx]
-        return np.array([direction[0], direction[1]], dtype=np.float32)
-
-    def _compute_splay_degrees(self, landmarks: np.ndarray) -> Dict[str, float]:
-        """중지를 기준으로 한 손가락 벌림 각도 계산"""
-        directions = {
-            "finger2": self._finger_direction_2d(landmarks, 5, 8),
-            "finger3": self._finger_direction_2d(landmarks, 9, 12),
-            "finger4": self._finger_direction_2d(landmarks, 13, 16),
-            "finger5": self._finger_direction_2d(landmarks, 17, 20),
-            "finger1": self._finger_direction_2d(landmarks, 2, 4),
+        
+        # HandLandmarker 생성
+        self.landmarker = vision.HandLandmarker.create_from_options(options)
+        
+        # 시각화용 유틸리티
+        self.mp_hands = mp.solutions.hands
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.mp_drawing_styles = mp.solutions.drawing_styles
+        
+        # 손가락 관절 인덱스 (기존과 동일)
+        self.finger_indices = {
+            'thumb': [1, 2, 3, 4],
+            'index': [5, 6, 7, 8],
+            'middle': [9, 10, 11, 12],
+            'ring': [13, 14, 15, 16],
+            'pinky': [17, 18, 19, 20]
         }
-
-        base_direction = directions["finger3"]
-
+        
+        self.finger_tips = [4, 8, 12, 16, 20]
+        
+        # 통계 및 타이밍
+        self.frame_count = 0
+        self.detection_count = 0
+        self.timestamp_ms = 0
+        
+        print("✓ HandTracker (Tasks API) initialized successfully")
+    
+    def process(self, frame: np.ndarray) -> Optional[Dict]:
+        """
+        프레임에서 손 감지 및 데이터 추출
+        
+        Args:
+            frame: BGR 이미지 (OpenCV 형식)
+            
+        Returns:
+            손 데이터 딕셔너리 또는 None
+        """
+        if frame is None or frame.size == 0:
+            return None
+        
+        self.frame_count += 1
+        self.timestamp_ms += 33  # 약 30fps 가정
+        
+        # BGR → RGB 변환 (MediaPipe 필수)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # MediaPipe Image 객체 생성
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        
+        # Tasks API로 손 감지 (타임스탬프 기반)
+        detection_result = self.landmarker.detect_for_video(mp_image, self.timestamp_ms)
+        
+        # 손이 감지되지 않음
+        if not detection_result.hand_landmarks:
+            if self.frame_count % 120 == 1:
+                print(f"[HandTracker] No hand detected (frame {self.frame_count})")
+            return None
+        
+        # 첫 번째 손 사용
+        hand_landmarks = detection_result.hand_landmarks[0]
+        hand_handedness = detection_result.handedness[0] if detection_result.handedness else None
+        
+        self.detection_count += 1
+        
+        # 화면에 랜드마크 그리기
+        self._draw_landmarks(frame, hand_landmarks)
+        
+        # 손 데이터 추출
+        hand_data = self._extract_hand_data(hand_landmarks, hand_handedness, frame.shape)
+        
+        # 주기적 통계 출력
+        if self.detection_count % 60 == 1:
+            detection_rate = (self.detection_count / self.frame_count) * 100
+            print(f"[HandTracker] Detection rate: {detection_rate:.1f}% - Tasks API active!")
+        
+        return hand_data
+    
+    def _draw_landmarks(self, frame: np.ndarray, hand_landmarks):
+        """
+        프레임에 손 랜드마크 그리기
+        Tasks API 결과를 Solutions API 호환 형식으로 변환
+        """
+        h, w = frame.shape[:2]
+        
+        # NormalizedLandmark 리스트를 protobuf 형식으로 변환
+        hand_landmarks_proto = landmark_pb2.NormalizedLandmarkList()
+        hand_landmarks_proto.landmark.extend([
+            landmark_pb2.NormalizedLandmark(x=lm.x, y=lm.y, z=lm.z) 
+            for lm in hand_landmarks
+        ])
+        
+        # MediaPipe 표준 스타일로 그리기
+        self.mp_drawing.draw_landmarks(
+            frame,
+            hand_landmarks_proto,
+            self.mp_hands.HAND_CONNECTIONS,
+            self.mp_drawing_styles.get_default_hand_landmarks_style(),
+            self.mp_drawing_styles.get_default_hand_connections_style()
+        )
+        
+        # 손가락 끝에 강조 표시
+        for tip_idx in self.finger_tips:
+            lm = hand_landmarks[tip_idx]
+            cx, cy = int(lm.x * w), int(lm.y * h)
+            cv2.circle(frame, (cx, cy), 8, (0, 255, 0), -1)  # 초록색 원
+            cv2.circle(frame, (cx, cy), 10, (255, 255, 255), 2)  # 흰색 테두리
+    
+    def _extract_hand_data(self, hand_landmarks, hand_handedness, frame_shape) -> Dict:
+        """랜드마크에서 제어 데이터 추출"""
+        h, w = frame_shape[:2]
+        
+        # 랜드마크를 픽셀 좌표로 변환
+        landmarks_px = []
+        for lm in hand_landmarks:
+            landmarks_px.append({
+                'x': lm.x * w,
+                'y': lm.y * h,
+                'z': lm.z
+            })
+        
+        # 손가락 굽힘 계산
+        finger_states = self._calculate_finger_states(landmarks_px)
+        
+        # 손 방향 정보 (Tasks API는 Category 객체 반환)
+        hand_label = hand_handedness[0].category_name if hand_handedness else "Unknown"
+        hand_score = hand_handedness[0].score if hand_handedness else 0.0
+        
         return {
-            "finger3": 0.0,
-            "finger2": self._signed_angle_2d(base_direction, directions["finger2"]),
-            "finger4": self._signed_angle_2d(base_direction, directions["finger4"]),
-            "finger5": self._signed_angle_2d(base_direction, directions["finger5"]),
-            "finger1": self._signed_angle_2d(base_direction, directions["finger1"]),
+            'landmarks': landmarks_px,
+            'finger_states': finger_states,
+            'hand_label': hand_label,
+            'hand_score': hand_score,
+            'detected': True
         }
+    
+    def _calculate_finger_states(self, landmarks_px) -> Dict[str, float]:
+        """각 손가락의 굽힘 정도 계산 (0.0=굽힘, 1.0=펴짐)"""
+        finger_states = {}
+        
+        for finger_name, indices in self.finger_indices.items():
+            if finger_name == 'thumb':
+                # 엄지: 각도 기반 계산
+                p1 = np.array([landmarks_px[indices[0]]['x'], landmarks_px[indices[0]]['y']])
+                p2 = np.array([landmarks_px[indices[1]]['x'], landmarks_px[indices[1]]['y']]) 
+                p3 = np.array([landmarks_px[indices[3]]['x'], landmarks_px[indices[3]]['y']])
+                
+                v1 = p2 - p1
+                v2 = p3 - p2
+                
+                cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
+                cos_angle = np.clip(cos_angle, -1.0, 1.0)
+                angle = np.arccos(cos_angle) * 180 / np.pi
+                
+                normalized = angle / 180.0
+                
+            else:
+                # 나머지 손가락: 거리 기반 계산
+                mcp = np.array([landmarks_px[indices[0]]['x'], landmarks_px[indices[0]]['y']])
+                pip = np.array([landmarks_px[indices[1]]['x'], landmarks_px[indices[1]]['y']])
+                tip = np.array([landmarks_px[indices[3]]['x'], landmarks_px[indices[3]]['y']])
+                
+                direct_dist = np.linalg.norm(tip - mcp)
+                joint_dist = np.linalg.norm(pip - mcp) + np.linalg.norm(tip - pip)
+                
+                ratio = direct_dist / (joint_dist + 1e-6)
+                normalized = max(0.0, min(1.0, ratio))
+            
+            finger_states[finger_name] = normalized
+        
+        return finger_states
+    
+    def get_statistics(self) -> Dict:
+        """추적 통계 반환"""
+        detection_rate = (self.detection_count / max(self.frame_count, 1)) * 100
+        return {
+            'total_frames': self.frame_count,
+            'detected_frames': self.detection_count,
+            'detection_rate': detection_rate,
+            'timestamp_ms': self.timestamp_ms
+        }
+    
+    def close(self):
+        """리소스 정리 (중요: 메모리 누수 방지)"""
+        if hasattr(self, 'landmarker'):
+            self.landmarker.close()
+            print("✓ HandLandmarker resources released")
 
-    @staticmethod
-    def _draw_landmarks(frame: np.ndarray, landmarks_xy: List[Tuple[int, int]]):
-        """프레임에 핸드 랜드마크 및 연결선 그리기"""
-        connections = [
-            (0, 1), (1, 2), (2, 3), (3, 4),
-            (0, 5), (5, 6), (6, 7), (7, 8),
-            (0, 9), (9, 10), (10, 11), (11, 12),
-            (0, 13), (13, 14), (14, 15), (15, 16),
-            (0, 17), (17, 18), (18, 19), (19, 20),
-            (5, 9), (9, 13), (13, 17)
-        ]
 
-        # 연결선 그리기
-        for start, end in connections:
-            cv2.line(frame, landmarks_xy[start], landmarks_xy[end], (0, 255, 0), 2)
-
-        # 랜드마크 점 그리기
-        for i, (x, y) in enumerate(landmarks_xy):
-            color, radius = (0, 0, 255), 4
-            if i == 0:  # 손목
-                color, radius = (255, 0, 0), 7
-            elif i in [4, 8, 12, 16, 20]:  # 손가락 끝
-                color, radius = (0, 255, 255), 6
-            cv2.circle(frame, (x, y), radius, color, -1)
+# 독립 실행 테스트
+if __name__ == "__main__":
+    print("="*60)
+    print("HAND TRACKER TEST (Tasks API)")
+    print("="*60)
+    
+    # 모델 파일 확인
+    if not os.path.exists(HAND_LANDMARKER_MODEL_PATH):
+        print(f"\n❌ Model file not found: {HAND_LANDMARKER_MODEL_PATH}")
+        print("\n📥 Download the model:")
+        print("wget -O models/hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task")
+        exit(1)
+    
+    print(f"✓ Model file found: {HAND_LANDMARKER_MODEL_PATH}")
+    print("\nPress 'Q' to quit")
+    print("="*60)
+    
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("❌ Cannot open camera")
+        exit(1)
+    
+    try:
+        tracker = HandTracker()
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # 손 추적
+            hand_data = tracker.process(frame)
+            
+            # 결과 표시
+            if hand_data:
+                cv2.putText(frame, "HAND DETECTED! (Tasks API)", (10, 40),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                
+                # 손가락 상태 표시
+                y = 90
+                for finger, value in hand_data['finger_states'].items():
+                    text = f"{finger}: {value:.2f}"
+                    color = (0, 255, 0) if value > 0.5 else (0, 165, 255)
+                    cv2.putText(frame, text, (10, y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    y += 30
+            else:
+                cv2.putText(frame, "NO HAND - Show hand to camera", (10, 40),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            cv2.imshow("Hand Tracker Test (Tasks API)", frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    finally:
+        if 'tracker' in locals():
+            tracker.close()
+        cap.release()
+        cv2.destroyAllWindows()
