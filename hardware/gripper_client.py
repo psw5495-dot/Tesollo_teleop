@@ -163,3 +163,46 @@ class DG5FDevClient:
         except Exception as e:
             logger.error(f"F/T offset set failed: {e}")
             raise
+
+    def get_ft_data(self) -> Dict[int, Dict[str, float]]:
+        """F/T 센서 데이터 읽기 (통합 버전)"""
+        try:
+            # F/T 센서 요청 패킷 (CMD=0x01, Data=0x05)
+            resp = self.transact(0x01, data=bytes([0x05]))
+            
+            if not resp or resp[0] != 0x01:
+                raise RuntimeError(f"Unexpected F/T response CMD: {resp[0] if resp else None}")
+            
+            payload = resp[1:]
+            sensors = {}
+            
+            # 5개 센서, 각각 12바이트 (6개 int16)
+            for i in range(5):
+                start = i * 12
+                if start + 12 <= len(payload):
+                    chunk = payload[start:start + 12]
+                    fx_raw, fy_raw, fz_raw, tx_raw, ty_raw, tz_raw = struct.unpack(">hhhhhh", chunk)
+                    
+                    sensors[i + 1] = {
+                        'fx': fx_raw / 10.0,  # 0.1N → N
+                        'fy': fy_raw / 10.0,
+                        'fz': fz_raw / 10.0,
+                        'tx': tx_raw / 10.0,  # 0.1Nm → Nm
+                        'ty': ty_raw / 10.0,
+                        'tz': tz_raw / 10.0,
+                    }
+            
+            return sensors
+            
+        except Exception as e:
+            logger.error(f"F/T data read failed: {e}")
+            return {}
+
+    def set_ft_offset(self):
+        """F/T 센서 오프셋 설정"""
+        try:
+            self.send_only(0x0B)  # Set F/T Offset 명령
+            logger.info("F/T sensor offset set")
+        except Exception as e:
+            logger.error(f"F/T offset set failed: {e}")
+            raise
