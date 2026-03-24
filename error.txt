@@ -1,0 +1,23 @@
+Traceback (most recent call last):
+  File "C:\Users\Administrator\PycharmProjects\Tesollo\main.py", line 345, in <module>
+    if system.initialize_hardware():
+       ~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\PycharmProjects\Tesollo\main.py", line 187, in initialize_hardware
+    if self.ft_sensor.connect():
+       ^^^^^^^^^^^^^^
+AttributeError: 'TeleopSystem' object has no attribute 'ft_sensor'
+Traceback (most recent call last):
+  File "C:\Users\Administrator\PycharmProjects\Tesollo\main.py", line 357, in <module>
+    system.shutdown()
+    ~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\PycharmProjects\Tesollo\main.py", line 308, in shutdown
+    self.ft_dashboard.stop()
+    ~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\PycharmProjects\Tesollo\ui\ft_dashboard.py", line 101, in stop
+    cv2.destroyWindow(self.window_name)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+cv2.error: OpenCV(4.13.0) D:\a\opencv-python\opencv-python\opencv\modules\highgui\src\window_w32.cpp:1261: error: (-27:Null pointer) NULL window: 'Tesollo F/T Sensor Dashboard' in function 'cvDestroyWindow'
+
+Initializing hardware components...
+❌ 시스템 에러: 'TeleopSystem' object has no attribute 'ft_sensor'
+Shutting down Tesollo Teleoperation System...
