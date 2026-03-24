@@ -1,0 +1,390 @@
+#visualization.py
+"""
+HUD 및 시각화 렌더링
+"""
+import cv2
+import numpy as np
+from typing import Dict, Optional, List, Tuple
+import logging
+
+from config.constants import MOTOR_ROLES
+
+logger = logging.getLogger(__name__)
+
+# OpenCV 폰트
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+
+def cv_safe_text(text: str) -> str:
+    """OpenCV용 텍스트 정리 (한글 지원)"""
+    if text is None:
+        return ""
+
+    # 특수 문자만 대체 (한글은 그대로 유지)
+    replacements = {
+        "°": "deg", "→": "->", "←": "<-",
+        "✅": "[OK]", "⚠️": "[WARN]",
+        "－": "-", "—": "-", "…": "...",
+    }
+
+    result = str(text)
+    for original, replacement in replacements.items():
+        result = result.replace(original, replacement)
+
+    # ASCII 강제 변환 제거 - 한글 그대로 반환
+    return result
+
+def put_text_outline(image: np.ndarray, text: str, position: Tuple[int, int],
+                     scale: float = 0.5, color: Tuple[int, int, int] = (255, 255, 255),
+                     thickness: int = 1):
+    """가시성을 위한 외곽선이 있는 텍스트 그리기"""
+    safe_text = cv_safe_text(text)
+
+    # 외곽선 (검은색)
+    cv2.putText(image, safe_text, position, FONT, scale, (0, 0, 0),
+                thickness + 2, cv2.LINE_AA)
+
+    # 메인 텍스트
+    cv2.putText(image, safe_text, position, FONT, scale, color,
+                thickness, cv2.LINE_AA)
+
+
+def draw_alpha_box(image: np.ndarray, x1: int, y1: int, x2: int, y2: int,
+                   color: Tuple[int, int, int] = (40, 40, 40), alpha: float = 0.55):
+    """반투명 박스 그리기"""
+    overlay = image.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+    cv2.addWeighted(overlay, alpha, image, 1.0 - alpha, 0, image)
+
+
+def get_duty_color(duty_value: int) -> Tuple[int, int, int]:
+    """듀티 값에 따른 색상 반환"""
+    if duty_value > 0:
+        return (0, 220, 255)  # 주황색 (양의 듀티)
+    elif duty_value < 0:
+        return (255, 180, 0)  # 파란색 (음의 듀티)
+    else:
+        return (180, 180, 180)  # 회색 (제로 듀티)
+
+
+def get_joint_label_offset(motor_id: int) -> Tuple[int, int]:
+    """모터 ID에 따른 라벨 오프셋 계산"""
+    local_index = (motor_id - 1) % 4
+    offsets = [
+        (-52, -10),  # j0
+        (-52, 12),  # j1
+        (8, -10),  # j2
+        (8, 12),  # j3
+    ]
+    return offsets[local_index]
+
+
+def draw_joint_angle_labels(frame: np.ndarray, landmarks_xy: Optional[List[Tuple[int, int]]],
+                            current_positions: Optional[Dict[int, int]],
+                            target_positions: Optional[Dict[int, int]] = None,
+                            motor_enabled: Optional[Dict[int, bool]] = None,
+                            isolate_mode: bool = False,
+                            isolate_motor_id: Optional[int] = None,
+                            show_disabled_labels: bool = False):
+    """관절 각도 라벨을 랜드마크에 그리기 - 개선된 가시성
+
+    개선사항:
+    - 오차 정보 추가 표시
+    - 오차 크기별 색상 구분
+    - 반투명 배경으로 가독성 향상
+    - 화면 경계 처리 개선
+
+    기존 기능 완전 보존:
+    - motor_enabled 필터링
+    - isolate_mode 지원
+    - show_disabled_labels 옵션
+    """
+    if landmarks_xy is None or current_positions is None:
+        return
+
+    for motor_id in range(1, 21):
+        if motor_id >= len(landmarks_xy):
+            continue
+        if motor_id not in current_positions:
+            continue
+
+        is_enabled = motor_enabled.get(motor_id, True) if motor_enabled else True
+
+        # 1) 비활성 모터 숨기기 (기존 로직 완전 보존)
+        if not show_disabled_labels and not is_enabled:
+            continue
+
+        # 2) 격리 모드 처리 (기존 로직 완전 보존)
+        if isolate_mode and isolate_motor_id is not None and motor_id != isolate_motor_id:
+            continue
+
+        x, y = landmarks_xy[motor_id]
+        dx, dy = get_joint_label_offset(motor_id)
+
+        # 현재 각도 계산 (0.1도 → 도 단위)
+        current_degrees = current_positions[motor_id] / 10.0
+
+        # 기본 색상 설정
+        base_color = (0, 230, 255) if is_enabled else (120, 120, 120)
+
+        if target_positions is not None and motor_id in target_positions:
+            target_degrees = target_positions[motor_id] / 10.0
+            error_degrees = target_degrees - current_degrees
+
+            # === 개선: 오차 크기별 색상 구분 ===
+            if is_enabled:
+                if abs(error_degrees) > 15.0:
+                    color = (0, 100, 255)  # 큰 오차: 주황색
+                elif abs(error_degrees) > 5.0:
+                    color = (0, 200, 255)  # 중간 오차: 노란색
+                else:
+                    color = (0, 255, 100)  # 작은 오차: 연두색
+            else:
+                color = base_color
+
+            # === 기존 형식 유지 + 오차 정보 추가 ===
+            main_label = f"M{motor_id:02d} C:{current_degrees:+.1f} T:{target_degrees:+.1f}"
+            error_label = f"Err:{error_degrees:+.1f}"
+        else:
+            color = base_color
+            main_label = f"M{motor_id:02d} C:{current_degrees:+.1f}"
+            error_label = None
+
+        # === 개선: 화면 경계 고려 위치 조정 ===
+        label_x = max(5, min(x + dx, frame.shape[1] - 200))
+        label_y = max(20, min(y + dy, frame.shape[0] - 35))
+
+        # === 개선: 반투명 배경 박스 (가독성 향상) ===
+        text_size = cv2.getTextSize(main_label, FONT, 0.36, 1)[0]
+        box_padding = 3
+        box_height = 26 if error_label else 16
+
+        box_x1 = label_x - box_padding
+        box_y1 = label_y - 12
+        box_x2 = label_x + text_size[0] + box_padding
+        box_y2 = label_y + box_height - 2
+
+        # 배경 그리기
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (box_x1, box_y1), (box_x2, box_y2), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+
+        # === 기존 방식으로 메인 라벨 그리기 ===
+        put_text_outline(frame, main_label, (x + dx, y + dy),
+                         scale=0.5,  # 0.36 → 0.5로 증가
+                         color=color, thickness=1)
+
+        # === 개선: 오차 정보 별도 라인 ===
+        if error_label:
+            put_text_outline(
+                frame,
+                error_label,
+                (label_x, label_y + 12),
+                scale=0.32,
+                color=color,
+                thickness=1
+            )
+
+
+def draw_duty_panel(frame: np.ndarray, duty_dict: Dict[int, int],
+                    motor_enabled: Optional[Dict[int, bool]] = None):
+    """듀티 사이클 정보 패널 그리기"""
+    height, width = frame.shape[:2]
+
+    # 화면 크기에 비례하는 패널 크기
+    panel_width = int(width * 0.25)  # 화면 너비의 25%
+    panel_height = int(height * 0.35)  # 화면 높이의 35%
+
+    panel_x1 = width - panel_width - 10
+    panel_y1 = 10
+    panel_x2 = width - 10
+    panel_y2 = panel_y1 + panel_height
+
+    # 반투명 배경
+    draw_alpha_box(frame, panel_x1, panel_y1, panel_x2, panel_y2,
+                   color=(35, 35, 35), alpha=0.62)
+
+    # 패널 제목
+    put_text_outline(frame, "Current Duty", (panel_x1 + 10, panel_y1 + 22),
+                     scale=0.58, color=(255, 255, 255), thickness=1)
+
+    # 통계 정보
+    total_absolute_duty = sum(abs(int(value)) for value in duty_dict.values())
+    active_count = sum(1 for value in duty_dict.values() if int(value) != 0)
+
+    put_text_outline(frame, f"sum|d|={total_absolute_duty} active={active_count}",
+                     (panel_x1 + 10, panel_y1 + 44), scale=0.45,
+                     color=(180, 255, 180), thickness=1)
+
+    # 모터별 듀티 표시 (2열로 배치)
+    column_x = [panel_x1 + 10, panel_x1 + 165]
+    start_y = panel_y1 + 70
+    row_height = 17
+
+    for index, motor_id in enumerate(range(1, 21)):
+        column = 0 if index < 10 else 1
+        row = index if index < 10 else index - 10
+        x = column_x[column]
+        y = start_y + row * row_height
+
+        duty_value = int(duty_dict.get(motor_id, 0))
+        label = f"M{motor_id:02d}: {duty_value:+4d}"
+
+        is_enabled = motor_enabled.get(motor_id, True) if motor_enabled else True
+        if not is_enabled:
+            label += " OFF"
+
+        color = get_duty_color(duty_value) if is_enabled else (120, 120, 120)
+        put_text_outline(frame, label, (x, y), scale=0.42, color=color, thickness=1)
+
+
+def format_disabled_motors_text(motor_enabled: Dict[int, bool], max_length: int = 60) -> str:
+    """비활성화된 모터 목록을 포맷된 텍스트로 반환"""
+    disabled_motors = [motor_id for motor_id in range(1, 21)
+                       if not motor_enabled.get(motor_id, True)]
+
+    if not disabled_motors:
+        return "None"
+
+    text = ",".join(str(motor_id) for motor_id in disabled_motors)
+    if len(text) > max_length:
+        return text[:max_length - 3] + "..."
+
+    return text
+
+
+def draw_control_panel(frame: np.ndarray, emergency_stop: bool, home_zero: bool,
+                       motor_input_buffer: str, flash_text: str,
+                       isolate_mode: bool, isolate_motor_id: Optional[int],
+                       motor_enabled: Dict[int, bool]):
+    """키보드 제어 정보 패널 그리기"""
+    height, width = frame.shape[:2]
+    panel_x1, panel_y2 = 10, height - 10
+    panel_x2, panel_y1 = 620, height - 245
+
+    # 반투명 배경
+    draw_alpha_box(frame, panel_x1, panel_y1, panel_x2, panel_y2,
+                   color=(35, 35, 35), alpha=0.58)
+
+    # 패널 제목
+    put_text_outline(frame, "Controls", (panel_x1 + 10, panel_y1 + 22),
+                     scale=0.58, color=(255, 255, 255), thickness=1)
+
+    # 전체 모터 상태 확인
+    enabled_count = sum(1 for enabled in motor_enabled.values() if enabled)
+    total_motors_status = f"{enabled_count}/20 motors active"
+
+    # 손가락별 상태 계산
+    finger_status_parts = []
+    finger_names_short = ["Th", "Id", "Md", "Rg", "Pk"]  # 엄지, 검지, 중지, 약지, 새끼
+
+    for i in range(5):
+        start_motor = i * 4 + 1
+        motor_group = list(range(start_motor, start_motor + 4))
+        active_count = sum(1 for mid in motor_group if motor_enabled.get(mid, True))
+
+        if active_count == 4:
+            status = f"{finger_names_short[i]}:ON"
+        elif active_count == 0:
+            status = f"{finger_names_short[i]}:OFF"
+        else:
+            status = f"{finger_names_short[i]}:{active_count}/4"
+
+        finger_status_parts.append(status)
+
+    finger_status_line = " | ".join(finger_status_parts)
+
+    control_lines = [
+        "[Q] Quit",
+        "[Z] Zero duty",
+        f"[X] EMO   : {'ON' if emergency_stop else 'OFF'}",
+        f"[R] HOME0 : {'ON' if home_zero else 'OFF'}",
+        "[0-20]+[Enter]: Motor ON/OFF | [1-5]+[F]: Finger ON/OFF",
+        "[T] Toggle ALL motors | [Backspace] Clear input",
+        f"Input       : {motor_input_buffer if motor_input_buffer else '-'}",
+        f"Disabled    : {format_disabled_motors_text(motor_enabled)}",
+        f"Status      : {total_motors_status}",
+        f"Fingers     : {finger_status_line}",
+    ]
+
+    # 각 라인 그리기
+    y_position = panel_y1 + 45
+    for line in control_lines:
+        put_text_outline(frame, line, (panel_x1 + 10, y_position),
+                         scale=0.42, color=(220, 220, 220), thickness=1)
+        y_position += 18
+
+    # 플래시 텍스트 (있는 경우)
+    if flash_text:
+        put_text_outline(frame, flash_text, (panel_x1 + 10, y_position + 10),
+                         scale=0.48, color=(0, 255, 255), thickness=1)
+
+
+def draw_runtime_hud(frame: np.ndarray, status_text: str,
+                     landmarks_xy: Optional[List[Tuple[int, int]]],
+                     current_positions: Optional[Dict[int, int]],
+                     target_positions: Optional[Dict[int, int]],
+                     duty_dict: Dict[int, int],
+                     emergency_stop: bool, home_zero: bool,
+                     motor_input_buffer: str = "", flash_text: str = "",
+                     isolate_mode: bool = False,
+                     isolate_motor_id: Optional[int] = None,
+                     motor_enabled: Optional[Dict[int, bool]] = None):
+    """완전한 런타임 HUD 그리기"""
+
+    # 상태 텍스트 색상 결정
+    status_color = (0, 255, 0)  # 기본 녹색
+
+    if emergency_stop:
+        status_color = (0, 0, 255)  # 빨간색
+    elif home_zero:
+        status_color = (0, 165, 255)  # 주황색
+
+    # 상태 텍스트 내용에 따른 색상 조정
+    status_lower = status_text.lower()
+    if any(keyword in status_lower for keyword in ["error", "show your hand", "emergency"]):
+        status_color = (0, 0, 255)  # 빨간색
+    elif "home0" in status_lower:
+        status_color = (0, 165, 255)  # 주황색
+
+    # 메인 상태 텍스트
+    put_text_outline(frame, status_text, (10, 50),
+                     scale=1.0, color=status_color, thickness=3)
+
+    # 각 구성 요소 그리기
+    draw_joint_angle_labels(
+        frame,
+        landmarks_xy,
+        current_positions,
+        target_positions,
+        motor_enabled,
+        isolate_mode=isolate_mode,
+        isolate_motor_id=isolate_motor_id,
+        show_disabled_labels=False
+    )
+
+    draw_duty_panel(frame, duty_dict, motor_enabled)
+
+    draw_control_panel(frame, emergency_stop, home_zero,
+                       motor_input_buffer, flash_text,
+                       isolate_mode, isolate_motor_id,
+                       motor_enabled or {})
+
+
+class HUDManager:
+    """HUD 관리 클래스"""
+
+    def __init__(self):
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+    def render_frame(self, frame: np.ndarray, **kwargs) -> np.ndarray:
+        """프레임에 모든 HUD 요소 렌더링"""
+        try:
+            draw_runtime_hud(frame, **kwargs)
+            return frame
+        except Exception as e:
+            self.logger.error(f"HUD 렌더링 중 오류: {e}")
+            # 오류 시 기본 텍스트만 표시
+            put_text_outline(frame, f"HUD Error: {str(e)}", (10, 30),
+                             color=(0, 0, 255))
+            return frame
