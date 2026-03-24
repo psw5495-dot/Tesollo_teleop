@@ -98,3 +98,52 @@ def check_emergency_conditions(current_positions: Dict[int, int],
         return True
 
     return False
+
+# safety.py에 추가할 내용
+
+def validate_commands_with_force_feedback(self, motor_commands, force_feedback=None):
+    """
+    모터 명령 검증 (F/T 센서 피드백 포함)
+    
+    Args:
+        motor_commands: 원래 모터 명령
+        force_feedback: (force_magnitude, torque_magnitude) 튜플
+        
+    Returns:
+        검증된 안전한 명령
+    """
+    # 기존 위치/속도 제한 적용
+    safe_commands = self.apply_position_limits(motor_commands)
+    safe_commands = self.apply_velocity_limits(safe_commands)
+    
+    # F/T 센서 기반 추가 제한
+    if force_feedback:
+        force_mag, torque_mag = force_feedback
+        
+        # 높은 힘 감지 시 속도 제한
+        if force_mag > FORCE_WARNING_THRESHOLD:
+            speed_reduction = max(0.1, 1.0 - (force_mag / MAX_FORCE_LIMIT))
+            safe_commands = self.scale_command_speeds(safe_commands, speed_reduction)
+            print(f"Speed reduced to {speed_reduction*100:.0f}% due to high force")
+        
+        # 임계값 초과 시 정지
+        if force_mag > MAX_FORCE_LIMIT or torque_mag > MAX_TORQUE_LIMIT:
+            safe_commands = self.generate_stop_commands()
+            print("Commands blocked due to force/torque limits")
+    
+    return safe_commands
+
+def get_safety_margins(self, force_feedback=None):
+    """현재 안전 여유율 계산"""
+    margins = {
+        'position': self.get_position_margins(),
+        'velocity': self.get_velocity_margins()
+    }
+    
+    if force_feedback:
+        force_mag, torque_mag = force_feedback
+        margins['force'] = max(0.0, 1.0 - force_mag / MAX_FORCE_LIMIT)
+        margins['torque'] = max(0.0, 1.0 - torque_mag / MAX_TORQUE_LIMIT)
+    
+    return margins
+
