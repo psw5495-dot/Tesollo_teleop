@@ -1,19 +1,7 @@
+C:\Users\Administrator\PycharmProjects\Tesollo\.venv\Scripts\python.exe C:\Users\Administrator\PycharmProjects\Tesollo\test_hand_only.py 
+=== 손 추적 단독 테스트 ===
+손을 카메라에 비추면 초록색 선과 점이 나타나야 합니다!
 Traceback (most recent call last):
-  File "C:\Users\Administrator\PycharmProjects\Tesollo\main.py", line 319, in main
-    system.main_control_loop()
-    ~~~~~~~~~~~~~~~~~~~~~~~~^^
-  File "C:\Users\Administrator\PycharmProjects\Tesollo\main.py", line 163, in main_control_loop
-    hand_data = self.hand_tracker.process(frame)
-                ^^^^^^^^^^^^^^^^^
-AttributeError: 'TeleopSystem' object has no attribute 'hand_tracker'
-Traceback (most recent call last):
-  File "C:\Users\Administrator\PycharmProjects\Tesollo\main.py", line 335, in <module>
-    main()
-    ~~~~^^
-  File "C:\Users\Administrator\PycharmProjects\Tesollo\main.py", line 331, in main
-    system.shutdown()
-    ~~~~~~~~~~~~~~~^^
-  File "C:\Users\Administrator\PycharmProjects\Tesollo\main.py", line 300, in shutdown
-    if self.gripper and self.gripper.connected:
-       ^^^^^^^^^^^^
-AttributeError: 'TeleopSystem' object has no attribute 'gripper'
+  File "C:\Users\Administrator\PycharmProjects\Tesollo\test_hand_only.py", line 8, in <module>
+    tracker = HandTrackerTasks()
+TypeError: HandTrackerTasks.__init__() missing 1 required positional argument: 'model_path'
