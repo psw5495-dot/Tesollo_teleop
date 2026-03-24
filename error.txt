@@ -1,2 +1,19 @@
-C:\Users\Administrator\PycharmProjects\Tesollo\.venv\Scripts\python.exe C:\Users\Administrator\PycharmProjects\Tesollo\main.py 
-❌ Hardware import error: cannot import name 'GripperClient' from 'hardware.gripper_client' (C:\Users\Administrator\PycharmProjects\Tesollo\hardware\gripper_client.py)
+Traceback (most recent call last):
+  File "C:\Users\Administrator\PycharmProjects\Tesollo\main.py", line 319, in main
+    system.main_control_loop()
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\PycharmProjects\Tesollo\main.py", line 163, in main_control_loop
+    hand_data = self.hand_tracker.process(frame)
+                ^^^^^^^^^^^^^^^^^
+AttributeError: 'TeleopSystem' object has no attribute 'hand_tracker'
+Traceback (most recent call last):
+  File "C:\Users\Administrator\PycharmProjects\Tesollo\main.py", line 335, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\Administrator\PycharmProjects\Tesollo\main.py", line 331, in main
+    system.shutdown()
+    ~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\PycharmProjects\Tesollo\main.py", line 300, in shutdown
+    if self.gripper and self.gripper.connected:
+       ^^^^^^^^^^^^
+AttributeError: 'TeleopSystem' object has no attribute 'gripper'
